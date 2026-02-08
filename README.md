@@ -20,6 +20,12 @@
   <h3 align="center"><a href="https://arxiv.org/abs/2512.05081">Paper</a> | <a href="https://cvlab-kaist.github.io/DeepForcing/">Website</a></h3>
 </p>
 
+<span style="font-size: 18px; font-weight: 800;">
+  New! Check Deep Forcing on Interactive Prompting, World Models & Causal Forcing at:
+  <a href="https://cvlab-kaist.github.io/DeepForcing/">https://cvlab-kaist.github.io/DeepForcing/</a>
+</span>
+
+
 ---
 
 Deep Forcing is a training-free framework that enables long-video generation in autoregressive video diffusion models by combining Deep Sink and Participative Compression. Deep Forcing achieves more than 12× length extrapolation (5s → 60s+) without fine-tuning. 
@@ -69,13 +75,15 @@ bash DS_inference.sh
 ```
 ```
 CUDA_VISIBLE_DEVICES=0 python inference.py \
-    --config_path configs/self_forcing_dmd/self_forcing_dmd_sink10.yaml \
-    --output_folder ./output \
+    --config_path configs/self_forcing_dmd/self_forcing_dmd_sink14.yaml \
+    --output_folder ./output/DS \
     --checkpoint_path checkpoints/self_forcing_dmd.pt \
-    --data_path ./prompts/MovieGenVideoBench_txt/line_0000.txt \
+    --data_path ./prompts/MovieGenVideoBench_txt/line_0010.txt \
     --use_ema \
     --is_ds_only 1
 ```
+Note: 
+* Sink size 10–14 is recommended for Deep Sink–only inference (configs: self_forcing_dmd_sink10.yaml–self_forcing_dmd_sink14.yaml).
 
 ### Deep Sink & Participative Compression
 Example inference script:
@@ -85,9 +93,9 @@ bash DS_PC_inference.sh
 ```
 CUDA_VISIBLE_DEVICES=0 python inference.py \
     --config_path configs/self_forcing_dmd/self_forcing_dmd_sink10.yaml \
-    --output_folder ./output \
+    --output_folder ./output/DS_PC \
     --checkpoint_path checkpoints/self_forcing_dmd.pt \
-    --data_path ./prompts/MovieGenVideoBench_txt/line_0000.txt \
+    --data_path ./prompts/MovieGenVideoBench_txt/line_0043.txt \
     --use_ema
 ```
 
