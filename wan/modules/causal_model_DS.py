@@ -8,6 +8,7 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
+from wan.modules.st_spectral_cpp import STSpectralCppCompressor, STSpectralCppConfig
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
@@ -16,6 +17,7 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+from typing import Optional
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -96,7 +98,9 @@ class CausalWanSelfAttention(nn.Module):
                  local_attn_size=-1,
                  sink_size=0,
                  qk_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 st_cfg: Optional[STSpectralCppConfig] = None,
+                 st_recent_window_frames: int = 4):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -107,6 +111,9 @@ class CausalWanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560
+        self.st_cfg = st_cfg or STSpectralCppConfig(enable=False)
+        self.st_recent_window_frames = max(0, int(st_recent_window_frames))
+        self.st_compressor = STSpectralCppCompressor(self.st_cfg)
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -125,7 +132,8 @@ class CausalWanSelfAttention(nn.Module):
         block_mask,
         kv_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        current_timestep=None
     ):
         r"""
         Args:
@@ -235,31 +243,82 @@ class CausalWanSelfAttention(nn.Module):
             sink_tokens_v =  self.sink_size * frame_seqlen
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens  = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                num_rolled_tokens_v = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens_v
-                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                kv_cache["v"][:, sink_tokens_v:sink_tokens_v + num_rolled_tokens_v] = \
-                    kv_cache["v"][:, sink_tokens_v + num_evicted_tokens:sink_tokens_v + num_evicted_tokens + num_rolled_tokens_v].clone()
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+            prev_global_end = kv_cache["global_end_index"].item()
+            prev_local_end = kv_cache["local_end_index"].item()
+            rolled_condition = self.local_attn_size != -1 and (current_end > prev_global_end) and (
+                    num_new_tokens + prev_local_end > kv_cache_size)
+
+            # Keep a compact recent query buffer for utility scoring.
+            if self.st_cfg.enable and self.local_attn_size != -1:
+                recent_window_tokens = max(
+                    num_new_tokens,
+                    self.st_cfg.recent_window_tokens,
+                    self.st_recent_window_frames * frame_seqlen,
+                )
+                self.st_compressor._update_recent_queries(
+                    kv_cache=kv_cache,
+                    new_queries=roped_query,
+                    window_tokens=recent_window_tokens,
+                )
+
+            if rolled_condition and self.st_cfg.enable:
+                cached_len = prev_local_end
+                if cached_len > 0:
+                    k_aug = torch.cat([kv_cache["k"][:, :cached_len], roped_key], dim=1)
+                    v_aug = torch.cat([kv_cache["v"][:, :cached_len], v], dim=1)
+                else:
+                    k_aug = roped_key
+                    v_aug = v
+
+                # With the current Deep Forcing inference loop, overflow happens on the
+                # first denoising step of each generated block.
+                is_first_timestep = bool(current_end > prev_global_end)
+                recent_q = kv_cache.get("st_recent_q", roped_query)
+                spatial_shape = (int(grid_sizes[0][1].item()), int(grid_sizes[0][2].item()))
+                keep_indices = self.st_compressor.compress(
+                    queries=recent_q,
+                    keys=k_aug,
+                    kv_cache=kv_cache,
+                    frame_seqlen=frame_seqlen,
+                    spatial_shape=spatial_shape,
+                    sink_tokens=sink_tokens,
+                    mandatory_recent_tokens=max(
+                        num_new_tokens,
+                        self.st_recent_window_frames * frame_seqlen
+                    ),
+                    is_first_timestep=is_first_timestep,
+                )
+                local_end_index = self.st_compressor.prune_cache_front(
+                    kv_cache=kv_cache,
+                    source_k=k_aug,
+                    source_v=v_aug,
+                    keep_indices=keep_indices,
+                )
             else:
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+                if rolled_condition:
+                    num_evicted_tokens = num_new_tokens + prev_local_end - kv_cache_size
+                    num_rolled_tokens = prev_local_end - num_evicted_tokens - sink_tokens
+                    num_rolled_tokens_v = prev_local_end - num_evicted_tokens - sink_tokens_v
+                    num_rolled_tokens = max(0, num_rolled_tokens)
+                    num_rolled_tokens_v = max(0, num_rolled_tokens_v)
+                    kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    kv_cache["v"][:, sink_tokens_v:sink_tokens_v + num_rolled_tokens_v] = \
+                        kv_cache["v"][:, sink_tokens_v + num_evicted_tokens:sink_tokens_v + num_evicted_tokens + num_rolled_tokens_v].clone()
+                    local_end_index = prev_local_end + current_end - prev_global_end - num_evicted_tokens
+                    local_start_index = local_end_index - num_new_tokens
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
+                else:
+                    local_end_index = prev_local_end + current_end - prev_global_end
+                    local_start_index = local_end_index - num_new_tokens
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
             key_win = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index] 
             val_win = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index] 
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size): 
+            if rolled_condition:
                 # Actual sink length (tokens) currently filled in the cache
-                sink_len_tokens = min(kv_cache["local_end_index"].item(), sink_tokens)
+                sink_len_tokens = min(local_end_index, sink_tokens)
 
                 # tail (recent) range
                 tail_end   = local_end_index
@@ -316,7 +375,9 @@ class CausalWanAttentionBlock(nn.Module):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 st_cfg: Optional[STSpectralCppConfig] = None,
+                 st_recent_window_frames: int = 4):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -328,7 +389,16 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        self.self_attn = CausalWanSelfAttention(
+            dim,
+            num_heads,
+            local_attn_size,
+            sink_size,
+            qk_norm,
+            eps,
+            st_cfg=st_cfg,
+            st_recent_window_frames=st_recent_window_frames
+        )
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -358,7 +428,8 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        current_timestep=None
     ):
         r"""
         Args:
@@ -378,7 +449,7 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
+            freqs, block_mask, kv_cache, current_start, cache_start, current_timestep)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -459,7 +530,15 @@ class CausalWanModelDS(ModelMixin, ConfigMixin):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 ST_enable: bool = True,
+                 ST_target_budget: int = 0,
+                 ST_grid_size=(4, 2, 2),
+                 ST_pool_size: int = 1024,
+                 ST_lambda_reg: float = 0.5,
+                 ST_epsilon: float = 1e-5,
+                 ST_recent_window_frames: int = 4,
+                 ST_keep_sinks: bool = True):
         r"""
         Initialize the diffusion model backbone.
 
@@ -529,12 +608,33 @@ class CausalWanModelDS(ModelMixin, ConfigMixin):
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
+        self.ST_cfg = STSpectralCppConfig(
+            enable=ST_enable,
+            target_budget=ST_target_budget,
+            grid_size=ST_grid_size,
+            pool_size=ST_pool_size,
+            lambda_reg=ST_lambda_reg,
+            epsilon=ST_epsilon,
+            recent_window_tokens=0,
+            keep_sinks=ST_keep_sinks,
+        )
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
-            CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
+            CausalWanAttentionBlock(
+                cross_attn_type,
+                dim,
+                ffn_dim,
+                num_heads,
+                local_attn_size,
+                sink_size,
+                qk_norm,
+                cross_attn_norm,
+                eps,
+                st_cfg=self.ST_cfg,
+                st_recent_window_frames=ST_recent_window_frames
+            )
             for _ in range(num_layers)
         ])
 
@@ -866,7 +966,8 @@ class CausalWanModelDS(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask
+            block_mask=self.block_mask,
+            current_timestep=t
         )
 
         def create_custom_forward(module):

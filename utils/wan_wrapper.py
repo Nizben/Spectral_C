@@ -124,16 +124,78 @@ class WanDiffusionWrapper(torch.nn.Module):
             sink_size=0,
             budget=16,
             recent=4,
+            st_enable=True,
+            st_target_budget=None,
+            st_grid_size=(4, 2, 2),
+            st_pool_size=1024,
+            st_lambda_reg=0.5,
+            st_epsilon=1e-5,
+            st_recent_window_frames=4,
+            st_keep_sinks=True,
+            **kwargs,
     ):
         super().__init__()
+        # Backward-compatible aliases for existing configs/CLI overrides.
+        if "Budget" in kwargs and kwargs["Budget"] is not None:
+            budget = kwargs.pop("Budget")
+        if "Recent" in kwargs and kwargs["Recent"] is not None:
+            recent = kwargs.pop("Recent")
+
+        if "ST_enable" in kwargs and kwargs["ST_enable"] is not None:
+            st_enable = kwargs.pop("ST_enable")
+        if "ST_target_budget" in kwargs and kwargs["ST_target_budget"] is not None:
+            st_target_budget = kwargs.pop("ST_target_budget")
+        if "ST_grid_size" in kwargs and kwargs["ST_grid_size"] is not None:
+            st_grid_size = kwargs.pop("ST_grid_size")
+        if "ST_pool_size" in kwargs and kwargs["ST_pool_size"] is not None:
+            st_pool_size = kwargs.pop("ST_pool_size")
+        if "ST_lambda_reg" in kwargs and kwargs["ST_lambda_reg"] is not None:
+            st_lambda_reg = kwargs.pop("ST_lambda_reg")
+        if "ST_epsilon" in kwargs and kwargs["ST_epsilon"] is not None:
+            st_epsilon = kwargs.pop("ST_epsilon")
+        if "ST_recent_window_frames" in kwargs and kwargs["ST_recent_window_frames"] is not None:
+            st_recent_window_frames = kwargs.pop("ST_recent_window_frames")
+        if "ST_keep_sinks" in kwargs and kwargs["ST_keep_sinks"] is not None:
+            st_keep_sinks = kwargs.pop("ST_keep_sinks")
+
+        if kwargs:
+            unknown = ", ".join(sorted(kwargs.keys()))
+            raise TypeError(f"Unexpected WanDiffusionWrapper kwargs: {unknown}")
+
+        if st_target_budget is None or int(st_target_budget) <= 0:
+            st_target_budget = 1560 * int(budget)
 
         if is_causal:
             if is_ds_only:
                 self.model = CausalWanModelDS.from_pretrained(
-                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                    f"wan_models/{model_name}/",
+                    local_attn_size=local_attn_size,
+                    sink_size=sink_size,
+                    ST_enable=st_enable,
+                    ST_target_budget=st_target_budget,
+                    ST_grid_size=st_grid_size,
+                    ST_pool_size=st_pool_size,
+                    ST_lambda_reg=st_lambda_reg,
+                    ST_epsilon=st_epsilon,
+                    ST_recent_window_frames=st_recent_window_frames,
+                    ST_keep_sinks=st_keep_sinks,
+                )
             else: 
                 self.model = CausalWanModel.from_pretrained(
-                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size, PC_capacity=1560*budget, PC_window=1560*recent)
+                    f"wan_models/{model_name}/",
+                    local_attn_size=local_attn_size,
+                    sink_size=sink_size,
+                    PC_capacity=1560*budget,
+                    PC_window=1560*recent,
+                    ST_enable=st_enable,
+                    ST_target_budget=st_target_budget,
+                    ST_grid_size=st_grid_size,
+                    ST_pool_size=st_pool_size,
+                    ST_lambda_reg=st_lambda_reg,
+                    ST_epsilon=st_epsilon,
+                    ST_recent_window_frames=st_recent_window_frames,
+                    ST_keep_sinks=st_keep_sinks,
+                )
         else:
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()

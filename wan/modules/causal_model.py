@@ -8,6 +8,7 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
+from wan.modules.st_spectral_cpp import STSpectralCppCompressor, STSpectralCppConfig
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
@@ -268,7 +269,9 @@ class CausalWanSelfAttention(nn.Module):
                  sink_size=0,
                  qk_norm=True,
                  eps=1e-6,
-                 PC: PCConfig | None = None):
+                 PC: PCConfig | None = None,
+                 ST: STSpectralCppConfig | None = None,
+                 st_recent_window_frames: int = 4):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -280,6 +283,9 @@ class CausalWanSelfAttention(nn.Module):
         self.eps = eps
         self.max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560
         self.PC = PC or PCConfig(enable=False)
+        self.ST = ST or STSpectralCppConfig(enable=False)
+        self.st_recent_window_frames = max(0, int(st_recent_window_frames))
+        self.st_compressor = STSpectralCppCompressor(self.ST)
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -298,7 +304,8 @@ class CausalWanSelfAttention(nn.Module):
         block_mask,
         kv_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        current_timestep=None
     ):
         r"""
         Args:
@@ -431,17 +438,93 @@ class CausalWanSelfAttention(nn.Module):
                 new_abs_frames = new_abs_frames.to(abs_frame_idx.dtype)
             else:
                 new_abs_frames = None
-            rolled_condition = self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+            prev_global_end = kv_cache["global_end_index"].item()
+            rolled_condition = self.local_attn_size != -1 and (current_end > prev_global_end) and (
                     num_new_tokens + prev_local_end > kv_cache_size)
+            st_active = self.ST.enable and self.local_attn_size != -1
             available_slots = kv_cache_size - prev_local_end
             need_evict = False
             new_tokens_integrated = False
 
             if self.PC.enable:
                 _mkv_update_win_q(kv_cache, roped_query, R=self.PC.window)
+            if st_active:
+                recent_window_tokens = max(
+                    num_new_tokens,
+                    self.ST.recent_window_tokens,
+                    self.st_recent_window_frames * frame_seqlen,
+                )
+                self.st_compressor._update_recent_queries(
+                    kv_cache=kv_cache,
+                    new_queries=roped_query,
+                    window_tokens=recent_window_tokens,
+                )
 
             if rolled_condition:
-                if self.PC.enable and available_slots < num_new_tokens:
+                if st_active and available_slots < num_new_tokens:
+                    cached_len = prev_local_end
+                    K_existing = kv_cache["k"][:, :cached_len]
+                    V_existing = kv_cache["v"][:, :cached_len]
+                    if cached_len > 0:
+                        K_aug = torch.cat([K_existing, roped_key], dim=1)
+                        V_aug = torch.cat([V_existing, v], dim=1)
+                        abs_existing = abs_frame_idx[:, :cached_len] if abs_frame_idx is not None else None
+                        if abs_existing is not None and new_abs_frames is not None:
+                            new_abs_tile = new_abs_frames.unsqueeze(0).expand(B_cache, -1)
+                            abs_aug = torch.cat([abs_existing, new_abs_tile], dim=1)
+                        else:
+                            abs_aug = None
+                        if topc_select_counts is not None:
+                            zeros_new = torch.zeros(
+                                (B_cache, num_new_tokens),
+                                dtype=topc_select_counts.dtype,
+                                device=topc_select_counts.device
+                            )
+                            counts_aug = torch.cat([topc_select_counts[:, :cached_len], zeros_new], dim=1)
+                        else:
+                            counts_aug = None
+                    else:
+                        K_aug = roped_key
+                        V_aug = v
+                        abs_aug = new_abs_frames.unsqueeze(0).expand(B_cache, -1) if new_abs_frames is not None else None
+                        counts_aug = torch.zeros(
+                            (B_cache, num_new_tokens),
+                            dtype=topc_select_counts.dtype,
+                            device=topc_select_counts.device
+                        ) if topc_select_counts is not None else None
+
+                    spatial_shape = (int(grid_sizes[0][1].item()), int(grid_sizes[0][2].item()))
+                    keep_indices = self.st_compressor.compress(
+                        queries=kv_cache.get("st_recent_q", roped_query),
+                        keys=K_aug,
+                        kv_cache=kv_cache,
+                        frame_seqlen=frame_seqlen,
+                        spatial_shape=spatial_shape,
+                        sink_tokens=max(sink_tokens, sink_tokens_v),
+                        mandatory_recent_tokens=max(
+                            num_new_tokens,
+                            self.st_recent_window_frames * frame_seqlen
+                        ),
+                        is_first_timestep=bool(current_end > prev_global_end),
+                    )
+                    local_end_index = self.st_compressor.prune_cache_front(
+                        kv_cache=kv_cache,
+                        source_k=K_aug,
+                        source_v=V_aug,
+                        keep_indices=keep_indices,
+                    )
+                    if abs_aug is not None:
+                        kv_cache["abs_frame_idx"][:, :local_end_index] = torch.gather(abs_aug, dim=1, index=keep_indices)
+                        if kv_cache["abs_frame_idx"].shape[1] > local_end_index:
+                            kv_cache["abs_frame_idx"][:, local_end_index:] = -1
+                    if counts_aug is not None:
+                        kv_cache["topc_select_counts"][:, :local_end_index] = torch.gather(counts_aug, dim=1, index=keep_indices)
+                        if kv_cache["topc_select_counts"].shape[1] > local_end_index:
+                            kv_cache["topc_select_counts"][:, local_end_index:] = 0
+                    prev_local_end = local_end_index
+                    available_slots = kv_cache_size - prev_local_end
+                    new_tokens_integrated = True
+                elif self.PC.enable and available_slots < num_new_tokens:
                     cached_len = prev_local_end
                     K_existing = kv_cache["k"][:, :cached_len]
                     V_existing = kv_cache["v"][:, :cached_len]
@@ -546,7 +629,7 @@ class CausalWanSelfAttention(nn.Module):
                 )
                 if sink_tokens + num_rolled_tokens < prev_local_end:
                     abs_frame_idx[:, sink_tokens + num_rolled_tokens:prev_local_end] = -1
-                local_end_index = prev_local_end + current_end - kv_cache["global_end_index"].item() - num_evicted_tokens
+                local_end_index = prev_local_end + current_end - prev_global_end - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
@@ -557,7 +640,7 @@ class CausalWanSelfAttention(nn.Module):
                     topc_select_counts[:, sink_tokens + num_rolled_tokens:prev_local_end] = 0
                 topc_select_counts[:, local_start_index:local_end_index] = 0
             elif not new_tokens_integrated:
-                local_end_index = prev_local_end + current_end - kv_cache["global_end_index"].item()
+                local_end_index = prev_local_end + current_end - prev_global_end
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
@@ -597,7 +680,9 @@ class CausalWanSelfAttention(nn.Module):
                 if self.sink_size > 0 and sink_len_tokens > 0:
                     if "sink_base_abs_start_frame" not in kv_cache:
                         kv_cache["sink_base_abs_start_frame"] = torch.tensor(desired_sink_abs_start, device=kv_cache["k"].device)
-                        delta = 21 - (self.PC.capacity // 1560) ## 18: 3, 17:4, 16:5, 15:6
+                        # Legacy PC path uses an initial calibration offset. ST path
+                        # starts from zero and uses strict delta updates afterwards.
+                        delta = 0 if st_active else 21 - (self.PC.capacity // 1560)
                     else:
                         delta = int(desired_sink_abs_start - kv_cache["sink_base_abs_start_frame"].item())
                         
@@ -626,7 +711,7 @@ class CausalWanSelfAttention(nn.Module):
                 top_start = sink_tokens
                 top_end = tail_start
                 top_len_tokens = max(0, top_end - top_start)
-                if top_len_tokens > 0:
+                if (not st_active) and top_len_tokens > 0:
                     top_len_frames = math.ceil(top_len_tokens / frame_seqlen)
                     desired_top_abs_start = tail_start_abs_frame - top_len_frames
                     if "topc_base_abs_start_frame" not in kv_cache:
@@ -663,7 +748,9 @@ class CausalWanAttentionBlock(nn.Module):
                  qk_norm=True,
                  cross_attn_norm=False,
                  eps=1e-6,
-                 PC: PCConfig | None = None):
+                 PC: PCConfig | None = None,
+                 ST: STSpectralCppConfig | None = None,
+                 st_recent_window_frames: int = 4):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -675,7 +762,10 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps, PC=PC)
+        self.self_attn = CausalWanSelfAttention(
+            dim, num_heads, local_attn_size, sink_size, qk_norm, eps,
+            PC=PC, ST=ST, st_recent_window_frames=st_recent_window_frames
+        )
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -705,7 +795,8 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        current_timestep=None
     ):
         r"""
         Args:
@@ -725,7 +816,7 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
+            freqs, block_mask, kv_cache, current_start, cache_start, current_timestep)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -812,7 +903,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  PC_window: int = 1560 * 4, 
                  PC_fusion: str = "sum",
                  PC_keep_sinks: bool = True,
-                 PC_topc_max_reuse: int = 7,):
+                 PC_topc_max_reuse: int = 7,
+                 ST_enable: bool = True,
+                 ST_target_budget: int = 0,
+                 ST_grid_size=(4, 2, 2),
+                 ST_pool_size: int = 1024,
+                 ST_lambda_reg: float = 0.5,
+                 ST_epsilon: float = 1e-5,
+                 ST_recent_window_frames: int = 4,
+                 ST_keep_sinks: bool = True,):
         r"""
         Initialize the diffusion model backbone.
 
@@ -892,13 +991,25 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             keep_sinks=PC_keep_sinks,
             topc_max_reuse=PC_topc_max_reuse,
         )
+        self.ST_cfg = STSpectralCppConfig(
+            enable=ST_enable,
+            target_budget=ST_target_budget,
+            grid_size=ST_grid_size,
+            pool_size=ST_pool_size,
+            lambda_reg=ST_lambda_reg,
+            epsilon=ST_epsilon,
+            recent_window_tokens=0,
+            keep_sinks=ST_keep_sinks,
+        )
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(
                 cross_attn_type, dim, ffn_dim, num_heads,
                 local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
-                PC=self.PC_cfg
+                PC=self.PC_cfg,
+                ST=self.ST_cfg,
+                st_recent_window_frames=ST_recent_window_frames
             )
             for _ in range(num_layers)
         ])
@@ -1231,7 +1342,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask
+            block_mask=self.block_mask,
+            current_timestep=t
         )
 
         def create_custom_forward(module):
