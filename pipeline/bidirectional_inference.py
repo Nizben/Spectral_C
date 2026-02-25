@@ -1,7 +1,7 @@
 from typing import List
 import torch
 
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import DEFAULT_WAN_MODEL_NAME, WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
 class BidirectionalInferencePipeline(torch.nn.Module):
@@ -15,10 +15,14 @@ class BidirectionalInferencePipeline(torch.nn.Module):
     ):
         super().__init__()
         # Step 1: Initialize all models
+        model_kwargs = dict(getattr(args, "model_kwargs", {}) or {})
+        model_name = model_kwargs.get("model_name") or getattr(args, "real_name", None) or DEFAULT_WAN_MODEL_NAME
+        model_kwargs.setdefault("model_name", model_name)
+
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=False) if generator is None else generator
-        self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
-        self.vae = WanVAEWrapper() if vae is None else vae
+            **model_kwargs, is_causal=False) if generator is None else generator
+        self.text_encoder = WanTextEncoder(model_name=model_name) if text_encoder is None else text_encoder
+        self.vae = WanVAEWrapper(model_name=model_name) if vae is None else vae
 
         # Step 2: Initialize all bidirectional wan hyperparmeters
         self.scheduler = self.generator.get_scheduler()

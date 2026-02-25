@@ -2,7 +2,7 @@ from typing import Tuple
 import torch
 
 from model.base import BaseModel
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import DEFAULT_WAN_MODEL_NAME, WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
 class CausalDiffusion(BaseModel):
@@ -32,13 +32,15 @@ class CausalDiffusion(BaseModel):
         self.noise_augmentation_max_timestep = getattr(args, "noise_augmentation_max_timestep", 0)
 
     def _initialize_models(self, args):
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+        model_kwargs = dict(getattr(args, "model_kwargs", {}) or {})
+        model_kwargs.setdefault("model_name", getattr(args, "real_name", None) or DEFAULT_WAN_MODEL_NAME)
+        self.generator = WanDiffusionWrapper(**model_kwargs, is_causal=True)
         self.generator.model.requires_grad_(True)
 
-        self.text_encoder = WanTextEncoder()
+        self.text_encoder = WanTextEncoder(model_name=model_kwargs["model_name"])
         self.text_encoder.requires_grad_(False)
 
-        self.vae = WanVAEWrapper()
+        self.vae = WanVAEWrapper(model_name=model_kwargs["model_name"])
         self.vae.requires_grad_(False)
 
     def generator_loss(

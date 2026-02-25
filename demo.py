@@ -24,7 +24,7 @@ from threading import Thread, Event
 from pipeline import CausalInferencePipeline
 from demo_utils.constant import ZERO_VAE_CACHE
 from demo_utils.vae_block3 import VAEDecoderWrapper
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder
+from utils.wan_wrapper import DEFAULT_WAN_MODEL_NAME, WanDiffusionWrapper, WanTextEncoder
 from demo_utils.utils import generate_timestamp
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 
@@ -45,7 +45,8 @@ config = OmegaConf.load(args.config_path)
 default_config = OmegaConf.load("configs/default_config.yaml")
 config = OmegaConf.merge(default_config, config)
 
-text_encoder = WanTextEncoder()
+MODEL_NAME = getattr(config, "real_name", None) or DEFAULT_WAN_MODEL_NAME
+text_encoder = WanTextEncoder(model_name=MODEL_NAME)
 
 # Global variables for dynamic model switching
 current_vae_decoder = None
@@ -100,7 +101,7 @@ def initialize_vae_decoder(use_taehv=False, use_trt=False):
         current_vae_decoder = TAEHVDiffusersWrapper()
     else:
         current_vae_decoder = VAEDecoderWrapper()
-        vae_state_dict = torch.load('wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth', map_location="cpu")
+        vae_state_dict = torch.load(f'wan_models/{MODEL_NAME}/Wan2.1_VAE.pth', map_location="cpu")
         decoder_state_dict = {}
         for key, value in vae_state_dict.items():
             if 'decoder.' in key or 'conv2' in key:
@@ -120,7 +121,8 @@ def initialize_vae_decoder(use_taehv=False, use_trt=False):
 # Initialize with default VAE
 vae_decoder = initialize_vae_decoder(use_taehv=False, use_trt=args.trt)
 
-transformer = WanDiffusionWrapper(is_causal=True)
+_model_kwargs = dict(getattr(config, "model_kwargs", {}) or {})
+transformer = WanDiffusionWrapper(model_name=MODEL_NAME, **_model_kwargs, is_causal=True)
 state_dict = torch.load(args.checkpoint_path, map_location="cpu")
 transformer.load_state_dict(state_dict['generator_ema'])
 

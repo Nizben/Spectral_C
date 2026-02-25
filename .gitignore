@@ -1,5 +1,60 @@
-__pycache__
-*.egg-info
+### Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
 
-wan_models
-checkpoints
+### Training / inference artifacts (do not track)
+output/
+outputs/
+results/
+runs/
+wandb/
+logs/
+log/
+tmp/
+temp/
+
+### Large model / checkpoint files (do not track)
+checkpoints/
+wan_models/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.npz
+*.npy
+*.onnx
+*.engine
+*.trt
+
+### Generated media (do not track)
+*.mp4
+*.webm
+*.mov
+*.mkv
+*.avi
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+*.wav
+*.mp3
+*.flac
+
+### Local-only prompt/data inputs (optional to track)
+prompts/custom/
+
+### Build / binary artifacts
+*.whl
+*.so
+*.dylib
+*.dll

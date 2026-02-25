@@ -1,3 +1,4 @@
+import os
 import types
 from typing import List, Optional
 import torch
@@ -11,10 +12,16 @@ from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 from wan.modules.causal_model_DS import CausalWanModelDS
 
+DEFAULT_WAN_MODEL_NAME = "Wan2.1-T2V-14B"
+
 
 class WanTextEncoder(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, model_name: str = DEFAULT_WAN_MODEL_NAME, base_dir: str = "wan_models") -> None:
         super().__init__()
+
+        model_dir = os.path.join(base_dir, model_name)
+        t5_ckpt_path = os.path.join(model_dir, "models_t5_umt5-xxl-enc-bf16.pth")
+        tokenizer_dir = os.path.join(model_dir, "google", "umt5-xxl")
 
         self.text_encoder = umt5_xxl(
             encoder_only=True,
@@ -23,12 +30,11 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
-                       map_location='cpu', weights_only=False)
+            torch.load(t5_ckpt_path, map_location='cpu', weights_only=False)
         )
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=f"{tokenizer_dir}/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -52,7 +58,7 @@ class WanTextEncoder(torch.nn.Module):
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, model_name: str = DEFAULT_WAN_MODEL_NAME, base_dir: str = "wan_models"):
         super().__init__()
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -66,8 +72,9 @@ class WanVAEWrapper(torch.nn.Module):
         self.std = torch.tensor(std, dtype=torch.float32)
 
         # init model
+        model_dir = os.path.join(base_dir, model_name)
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=os.path.join(model_dir, "Wan2.1_VAE.pth"),
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -116,7 +123,7 @@ class WanVAEWrapper(torch.nn.Module):
 class WanDiffusionWrapper(torch.nn.Module):
     def __init__(
             self,
-            model_name="Wan2.1-T2V-1.3B",
+            model_name=DEFAULT_WAN_MODEL_NAME,
             timestep_shift=8.0,
             is_causal=False,
             is_ds_only=False,
@@ -131,6 +138,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             st_lambda_reg=0.5,
             st_epsilon=1e-5,
             st_recent_window_frames=4,
+            st_max_query_tokens=2048,
             st_keep_sinks=True,
             **kwargs,
     ):
@@ -155,6 +163,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             st_epsilon = kwargs.pop("ST_epsilon")
         if "ST_recent_window_frames" in kwargs and kwargs["ST_recent_window_frames"] is not None:
             st_recent_window_frames = kwargs.pop("ST_recent_window_frames")
+        if "ST_max_query_tokens" in kwargs and kwargs["ST_max_query_tokens"] is not None:
+            st_max_query_tokens = kwargs.pop("ST_max_query_tokens")
         if "ST_keep_sinks" in kwargs and kwargs["ST_keep_sinks"] is not None:
             st_keep_sinks = kwargs.pop("ST_keep_sinks")
 
@@ -164,6 +174,21 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if st_target_budget is None or int(st_target_budget) <= 0:
             st_target_budget = 1560 * int(budget)
+
+        # ST budget is in tokens, but the KV cache has a hard capacity determined by local attention.
+        # If you request a larger budget than the cache, ST compression will try to keep more tokens
+        # than can be written back into `kv_cache["k"]` / `kv_cache["v"]`.
+        if is_causal:
+            if local_attn_size != -1:
+                kv_capacity_tokens = int(local_attn_size) * 1560
+            else:
+                kv_capacity_tokens = 32760
+            if int(st_target_budget) > kv_capacity_tokens:
+                print(
+                    f"[ST] Capping ST_target_budget from {int(st_target_budget)} to {kv_capacity_tokens} "
+                    f"(KV cache capacity; local_attn_size={local_attn_size})."
+                )
+                st_target_budget = kv_capacity_tokens
 
         if is_causal:
             if is_ds_only:
@@ -178,6 +203,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     ST_lambda_reg=st_lambda_reg,
                     ST_epsilon=st_epsilon,
                     ST_recent_window_frames=st_recent_window_frames,
+                    ST_max_query_tokens=st_max_query_tokens,
                     ST_keep_sinks=st_keep_sinks,
                 )
             else: 
@@ -194,6 +220,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     ST_lambda_reg=st_lambda_reg,
                     ST_epsilon=st_epsilon,
                     ST_recent_window_frames=st_recent_window_frames,
+                    ST_max_query_tokens=st_max_query_tokens,
                     ST_keep_sinks=st_keep_sinks,
                 )
         else:

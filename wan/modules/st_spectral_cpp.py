@@ -15,6 +15,7 @@ class STSpectralCppConfig:
         lambda_reg: float = 0.5,
         epsilon: float = 1e-5,
         recent_window_tokens: int = 0,
+        max_query_tokens: int = 2048,
         keep_sinks: bool = True,
     ):
         self.enable = bool(enable)
@@ -24,6 +25,7 @@ class STSpectralCppConfig:
         self.lambda_reg = float(lambda_reg)
         self.epsilon = float(epsilon)
         self.recent_window_tokens = int(recent_window_tokens)
+        self.max_query_tokens = int(max_query_tokens)
         self.keep_sinks = bool(keep_sinks)
 
 
@@ -95,49 +97,30 @@ class STSpectralCppCompressor:
         bsz = phi.shape[0]
         height, width = spatial_shape
         frame_tokens = height * width
-        if frame_tokens <= 0:
-            return torch.zeros((bsz, seq_len), dtype=torch.bool, device=phi.device)
-
         time_frames = math.ceil(seq_len / frame_tokens)
-        padded = torch.full(
-            (bsz, time_frames * frame_tokens),
-            -float("inf"),
-            device=phi.device,
-            dtype=phi.dtype,
-        )
+        
+        # Pad phi to form a perfect 3D volume
+        padded = torch.full((bsz, time_frames * frame_tokens), -float("inf"), device=phi.device, dtype=phi.dtype)
         padded[:, :seq_len] = phi
-        phi_3d = padded.view(bsz, time_frames, height, width)
-
-        bt, bh, bw = self.cfg.grid_size
-        bt = max(1, bt)
-        bh = max(1, bh)
-        bw = max(1, bw)
-
+        
+        # Reshape for max_pool3d: [B, Channels(1), T, H, W]
+        phi_3d = padded.view(bsz, 1, time_frames, height, width).to(torch.float32)
+        
+        bt, bh, bw = [max(1, x) for x in self.cfg.grid_size]
+        
+        # F.max_pool3d natively returns the flattened 1D indices! O(1) Python overhead.
+        _, indices = F.max_pool3d(phi_3d, kernel_size=(bt, bh, bw), stride=(bt, bh, bw), return_indices=True)
+        
+        # Flatten and filter invalid indices
+        valid_indices = indices.view(bsz, -1)
+        valid_indices = valid_indices[valid_indices < seq_len]
+        
         anchor_mask = torch.zeros((bsz, seq_len), dtype=torch.bool, device=phi.device)
-        for t0 in range(0, time_frames, bt):
-            t1 = min(time_frames, t0 + bt)
-            for h0 in range(0, height, bh):
-                h1 = min(height, h0 + bh)
-                for w0 in range(0, width, bw):
-                    w1 = min(width, w0 + bw)
-                    chunk = phi_3d[:, t0:t1, h0:h1, w0:w1].reshape(bsz, -1)
-                    local = chunk.argmax(dim=-1)
-                    global_idx = self._map_chunk_local_to_global(
-                        local,
-                        t_start=t0,
-                        x_start=h0,
-                        y_start=w0,
-                        chunk_t=(t1 - t0),
-                        chunk_h=(h1 - h0),
-                        chunk_w=(w1 - w0),
-                        height=height,
-                        width=width,
-                    )
-                    valid = global_idx < seq_len
-                    if valid.any():
-                        rows = torch.arange(bsz, device=phi.device)[valid]
-                        cols = global_idx[valid]
-                        anchor_mask[rows, cols] = True
+        for b in range(bsz):
+            b_indices = indices[b].flatten()
+            b_valid = b_indices[b_indices < seq_len]
+            anchor_mask[b, b_valid] = True
+            
         return anchor_mask
 
     def _spectral_select_single_batch(
@@ -147,19 +130,15 @@ class STSpectralCppCompressor:
         selected_idx: torch.Tensor,
         budget: int,
     ) -> torch.Tensor:
-        # keys_b: [N_k, H, D]
         n_k, n_h, d_h = keys_b.shape
         flat_dim = n_h * d_h
 
         if selected_idx.numel() >= budget:
-            selected_idx = selected_idx[:budget]
-            return torch.sort(selected_idx).values
+            return torch.sort(selected_idx[:budget]).values
 
         selected_mask = torch.zeros(n_k, dtype=torch.bool, device=keys_b.device)
         selected_mask[selected_idx] = True
         remaining = budget - int(selected_idx.numel())
-        if remaining <= 0:
-            return torch.sort(selected_idx).values
 
         candidate_idx = torch.where(~selected_mask)[0]
         if candidate_idx.numel() == 0:
@@ -169,14 +148,25 @@ class STSpectralCppCompressor:
         pool_pick_local = self._topk_indices(phi_b[candidate_idx], k_pool)
         pool_idx = candidate_idx[pool_pick_local]
 
+        # OPTIMIZATION 1: Truncate the QR basis to prevent GPU stalling
         if selected_idx.numel() > 0:
-            basis_rows = keys_b[selected_idx].reshape(-1, flat_dim).to(torch.float32)
+            qr_seed_idx = selected_idx
+            if qr_seed_idx.numel() > 256: 
+                # Take top 256 anchors by utility to seed the basis
+                top_seed_local = self._topk_indices(phi_b[qr_seed_idx], 256)
+                qr_seed_idx = qr_seed_idx[top_seed_local]
+            basis_rows = keys_b[qr_seed_idx].reshape(-1, flat_dim).to(torch.float32)
             basis = self._orthonormal_rows(basis_rows)
         else:
             basis = torch.zeros((0, flat_dim), dtype=torch.float32, device=keys_b.device)
 
         chosen = [selected_idx]
-        while remaining > 0 and pool_idx.numel() > 0:
+        
+        # OPTIMIZATION 2: Limit the iterative Gram-Schmidt to max 128 iterations.
+        # This captures the most crucial novelty without looping thousands of times in Python.
+        spectral_iterations = min(remaining, 128) 
+        
+        while spectral_iterations > 0 and pool_idx.numel() > 0:
             pool_vecs = keys_b[pool_idx].reshape(-1, flat_dim).to(torch.float32)
             if basis.numel() == 0:
                 residuals = pool_vecs
@@ -193,15 +183,18 @@ class STSpectralCppCompressor:
             chosen.append(best_global)
 
             vec = residuals[best_local:best_local + 1]
-            if torch.isfinite(vec).all():
+            if torch.isfinite(vec).all() and vec.norm() > self.cfg.epsilon:
                 vec = F.normalize(vec, p=2, dim=-1, eps=self.cfg.epsilon)
                 basis = torch.cat([basis, vec], dim=0)
 
             pool_idx = torch.cat([pool_idx[:best_local], pool_idx[best_local + 1:]], dim=0)
             remaining -= 1
+            spectral_iterations -= 1
 
         selected = torch.cat(chosen, dim=0) if len(chosen) > 0 else torch.zeros(0, dtype=torch.long, device=keys_b.device)
         selected = torch.unique(selected, sorted=True)
+        
+        # OPTIMIZATION 3: If budget remains, fill instantly with remaining Top-Utility (\phi)
         if selected.numel() < budget:
             selected_mask = torch.zeros(n_k, dtype=torch.bool, device=keys_b.device)
             selected_mask[selected] = True
@@ -212,9 +205,7 @@ class STSpectralCppCompressor:
                 selected = torch.cat([selected, tail_candidates[fill_local]], dim=0)
                 selected = torch.unique(selected, sorted=True)
 
-        if selected.numel() > budget:
-            selected = selected[:budget]
-        return torch.sort(selected).values
+        return torch.sort(selected[:budget]).values
 
     def compress(
         self,
@@ -237,20 +228,65 @@ class STSpectralCppCompressor:
             if isinstance(cached, torch.Tensor) and cached.shape[0] == bsz:
                 return cached
 
-        q_bar = queries.to(torch.float32).sum(dim=1)  # [B, H, D]
-        phi = torch.einsum("bhd,bkhd->bk", q_bar, keys.to(torch.float32))
-
+        # ==========================================================
+        # Fast-path: if budget is fully consumed by sinks + mandatory recent,
+        # there is no anchor/novelty selection to do. Avoid O(N_q * N_k) scoring.
+        # ==========================================================
         target_budget = self.cfg.target_budget if self.cfg.target_budget > 0 else n_k
         target_budget = min(int(target_budget), n_k)
         target_budget = max(1, target_budget)
 
-        # Keep most recent tokens to preserve current block fidelity.
         mandatory_recent_tokens = int(max(0, mandatory_recent_tokens))
         mandatory_recent_tokens = min(mandatory_recent_tokens, target_budget, n_k)
 
         keep_sink_tokens = int(max(0, sink_tokens if self.cfg.keep_sinks else 0))
         keep_sink_tokens = min(keep_sink_tokens, n_k - mandatory_recent_tokens)
         keep_sink_tokens = min(keep_sink_tokens, target_budget - mandatory_recent_tokens)
+
+        if target_budget == n_k:
+            keep = torch.arange(n_k, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+            kv_cache["st_cached_keep_indices"] = keep
+            return keep
+
+        if keep_sink_tokens + mandatory_recent_tokens == target_budget:
+            sink_idx = torch.arange(keep_sink_tokens, device=device, dtype=torch.long)
+            recent_idx = torch.arange(n_k - mandatory_recent_tokens, n_k, device=device, dtype=torch.long)
+            keep_1d = torch.cat([sink_idx, recent_idx], dim=0)
+            keep = keep_1d.unsqueeze(0).expand(bsz, -1)
+            kv_cache["st_cached_keep_indices"] = keep
+            return keep
+
+        # ==========================================================
+        # FIXED PHASE 2: Chunked Max-Fusion Utility Scoring
+        # Preserves high-entropy spatial details (like the driver)
+        # ==========================================================
+        max_q = int(getattr(self.cfg, "max_query_tokens", 0) or 0)
+        if max_q > 0 and queries.shape[1] > max_q:
+            # Keep the most recent queries only. This dramatically reduces the
+            # O(N_q * N_k) cost of utility scoring without changing the cache layout.
+            queries = queries[:, -max_q:]
+
+        B_q, N_q, H_q, D_q = queries.shape
+        
+        # Initialize phi with negative infinity
+        phi = torch.full((B_q, n_k), -float('inf'), device=device, dtype=torch.float32)
+        
+        # Transpose for batch-matrix multiplication: [B, H, N, D]
+        q_flat = queries.to(torch.float32).transpose(1, 2)
+        k_flat = keys.to(torch.float32).transpose(1, 2)
+        
+        # Process in chunks to maintain Latency-Lock and avoid OOM
+        chunk_size = 512
+        for start in range(0, N_q, chunk_size):
+            end = min(start + chunk_size, N_q)
+            q_chunk = q_flat[:, :, start:end, :] 
+            
+            # Dot product across D, sum across H: yields [B, Chunk, N_k]
+            scores = torch.einsum('bhqd,bhkd->bqk', q_chunk, k_flat)
+            
+            # Max across the temporal/spatial queries in this chunk
+            chunk_max, _ = scores.max(dim=1)
+            phi = torch.maximum(phi, chunk_max)
 
         selected_mask = torch.zeros((bsz, n_k), dtype=torch.bool, device=device)
         if keep_sink_tokens > 0:

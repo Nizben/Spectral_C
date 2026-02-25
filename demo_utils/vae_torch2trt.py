@@ -13,6 +13,9 @@ import torch
 import tensorrt as trt
 
 from utils.dataset import ShardingLMDBDataset
+from utils.wan_wrapper import DEFAULT_WAN_MODEL_NAME
+
+MODEL_NAME = DEFAULT_WAN_MODEL_NAME
 
 data_path = "/mnt/localssd/wanx_14B_shift-3.0_cfg-5.0_lmdb_oneshard"
 dataset = ShardingLMDBDataset(data_path, max_pair=int(1e8))
@@ -41,7 +44,7 @@ inputs = [dummy_input, is_first_frame, *dummy_cache_input]
 # ─────────────────────────────────────────────────────────
 model = VAEDecoderWrapperSingle().half().cuda().eval()
 
-vae_state_dict = torch.load('wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth', map_location="cpu")
+vae_state_dict = torch.load(f'wan_models/{MODEL_NAME}/Wan2.1_VAE.pth', map_location="cpu")
 decoder_state_dict = {}
 for key, value in vae_state_dict.items():
     if 'decoder.' in key or 'conv2' in key:

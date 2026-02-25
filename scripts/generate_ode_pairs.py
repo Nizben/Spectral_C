@@ -1,6 +1,6 @@
 from utils.distributed import launch_distributed_job
 from utils.scheduler import FlowMatchScheduler
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder
+from utils.wan_wrapper import DEFAULT_WAN_MODEL_NAME, WanDiffusionWrapper, WanTextEncoder
 from utils.dataset import TextDataset
 import torch.distributed as dist
 from tqdm import tqdm
@@ -11,8 +11,8 @@ import os
 
 
 def init_model(device):
-    model = WanDiffusionWrapper().to(device).to(torch.float32)
-    encoder = WanTextEncoder().to(device).to(torch.float32)
+    model = WanDiffusionWrapper(model_name=DEFAULT_WAN_MODEL_NAME).to(device).to(torch.float32)
+    encoder = WanTextEncoder(model_name=DEFAULT_WAN_MODEL_NAME).to(device).to(torch.float32)
     model.model.requires_grad_(False)
 
     scheduler = FlowMatchScheduler(

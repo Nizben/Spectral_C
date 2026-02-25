@@ -1,7 +1,8 @@
 from typing import List, Optional
 import torch
+import time
 
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import DEFAULT_WAN_MODEL_NAME, WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 
@@ -24,10 +25,13 @@ class CausalInferencePipeline(torch.nn.Module):
             model_kwargs["budget"] = int(getattr(args, "Budget"))
         if "recent" not in model_kwargs and hasattr(args, "Recent"):
             model_kwargs["recent"] = int(getattr(args, "Recent"))
+
+        model_name = model_kwargs.get("model_name") or getattr(args, "real_name", None) or DEFAULT_WAN_MODEL_NAME
+        model_kwargs.setdefault("model_name", model_name)
         self.generator = WanDiffusionWrapper(
             **model_kwargs, is_causal=True) if generator is None else generator
-        self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
-        self.vae = WanVAEWrapper() if vae is None else vae
+        self.text_encoder = WanTextEncoder(model_name=model_name) if text_encoder is None else text_encoder
+        self.vae = WanVAEWrapper(model_name=model_name) if vae is None else vae
 
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
@@ -115,6 +119,17 @@ class CausalInferencePipeline(torch.nn.Module):
             block_end = torch.cuda.Event(enable_timing=True)
             init_start.record()
 
+        # Paper-style throughput accounting (denoiser only; excludes VAE decode)
+        denoise_s_total = 0.0
+        denoise_s_post_roll = 0.0
+        fwd_denoise_s_total = 0.0
+        fwd_denoise_s_post_roll = 0.0
+        fwd_context_s_total = 0.0
+        fwd_context_s_post_roll = 0.0
+        frames_total = 0
+        frames_post_roll = 0
+        post_roll_start_frame = self.local_attn_size if self.local_attn_size != -1 else None
+
         # Step 1: Initialize KV cache to all zeros
         if self.kv_cache1 is None:
             self._initialize_kv_cache(
@@ -185,6 +200,13 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
         for current_num_frames in all_num_frames:
+            # Time the denoiser+cache update for this block (Step 3.1 + 3.3).
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            block_t0 = time.perf_counter()
+            fwd_denoise_events = []
+            fwd_context_events = []
+
             if profile:
                 block_start.record()
 
@@ -201,6 +223,10 @@ class CausalInferencePipeline(torch.nn.Module):
                     dtype=torch.int64) * current_timestep
 
                 if index < len(self.denoising_step_list) - 1:
+                    if torch.cuda.is_available():
+                        ev_s = torch.cuda.Event(enable_timing=True)
+                        ev_e = torch.cuda.Event(enable_timing=True)
+                        ev_s.record()
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
@@ -209,6 +235,9 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                    if torch.cuda.is_available():
+                        ev_e.record()
+                        fwd_denoise_events.append((ev_s, ev_e))
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -218,6 +247,10 @@ class CausalInferencePipeline(torch.nn.Module):
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
                     # for getting real output
+                    if torch.cuda.is_available():
+                        ev_s = torch.cuda.Event(enable_timing=True)
+                        ev_e = torch.cuda.Event(enable_timing=True)
+                        ev_s.record()
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
@@ -226,12 +259,19 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                    if torch.cuda.is_available():
+                        ev_e.record()
+                        fwd_denoise_events.append((ev_s, ev_e))
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            if torch.cuda.is_available():
+                ev_s = torch.cuda.Event(enable_timing=True)
+                ev_e = torch.cuda.Event(enable_timing=True)
+                ev_s.record()
             self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=conditional_dict,
@@ -240,6 +280,30 @@ class CausalInferencePipeline(torch.nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
             )
+            if torch.cuda.is_available():
+                ev_e.record()
+                fwd_context_events.append((ev_s, ev_e))
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            block_denoise_s = time.perf_counter() - block_t0
+            denoise_s_total += block_denoise_s
+            frames_total += int(current_num_frames)
+
+            if torch.cuda.is_available():
+                fwd_denoise_s = sum(s.elapsed_time(e) for s, e in fwd_denoise_events) / 1000.0
+                fwd_context_s = sum(s.elapsed_time(e) for s, e in fwd_context_events) / 1000.0
+            else:
+                fwd_denoise_s = 0.0
+                fwd_context_s = 0.0
+            fwd_denoise_s_total += float(fwd_denoise_s)
+            fwd_context_s_total += float(fwd_context_s)
+
+            if post_roll_start_frame is not None and int(current_start_frame) >= int(post_roll_start_frame):
+                denoise_s_post_roll += block_denoise_s
+                frames_post_roll += int(current_num_frames)
+                fwd_denoise_s_post_roll += float(fwd_denoise_s)
+                fwd_context_s_post_roll += float(fwd_context_s)
 
             if profile:
                 block_end.record()
@@ -259,8 +323,28 @@ class CausalInferencePipeline(torch.nn.Module):
             vae_start.record()
 
         # Step 4: Decode the output
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        vae_t0 = time.perf_counter()
         video = self.vae.decode_to_pixel(output, use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        vae_s = time.perf_counter() - vae_t0
+
+        # Store for outer logger (inference.py)
+        self.last_perf = {
+            "denoise_seconds_total": float(denoise_s_total),
+            "denoise_seconds_post_roll": float(denoise_s_post_roll),
+            "forward_denoise_seconds_total": float(fwd_denoise_s_total),
+            "forward_denoise_seconds_post_roll": float(fwd_denoise_s_post_roll),
+            "forward_context_seconds_total": float(fwd_context_s_total),
+            "forward_context_seconds_post_roll": float(fwd_context_s_post_roll),
+            "vae_seconds": float(vae_s),
+            "frames_total": int(frames_total),
+            "frames_post_roll": int(frames_post_roll),
+            "post_roll_start_frame": int(post_roll_start_frame) if post_roll_start_frame is not None else None,
+        }
 
         if profile:
             # End VAE timing and synchronize CUDA

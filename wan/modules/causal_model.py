@@ -441,6 +441,7 @@ class CausalWanSelfAttention(nn.Module):
             prev_global_end = kv_cache["global_end_index"].item()
             rolled_condition = self.local_attn_size != -1 and (current_end > prev_global_end) and (
                     num_new_tokens + prev_local_end > kv_cache_size)
+            is_first_timestep = bool(current_end > prev_global_end)
             st_active = self.ST.enable and self.local_attn_size != -1
             available_slots = kv_cache_size - prev_local_end
             need_evict = False
@@ -448,7 +449,7 @@ class CausalWanSelfAttention(nn.Module):
 
             if self.PC.enable:
                 _mkv_update_win_q(kv_cache, roped_query, R=self.PC.window)
-            if st_active:
+            if is_first_timestep and st_active:
                 recent_window_tokens = max(
                     num_new_tokens,
                     self.ST.recent_window_tokens,
@@ -494,19 +495,30 @@ class CausalWanSelfAttention(nn.Module):
                         ) if topc_select_counts is not None else None
 
                     spatial_shape = (int(grid_sizes[0][1].item()), int(grid_sizes[0][2].item()))
-                    keep_indices = self.st_compressor.compress(
-                        queries=kv_cache.get("st_recent_q", roped_query),
-                        keys=K_aug,
-                        kv_cache=kv_cache,
-                        frame_seqlen=frame_seqlen,
-                        spatial_shape=spatial_shape,
-                        sink_tokens=max(sink_tokens, sink_tokens_v),
-                        mandatory_recent_tokens=max(
-                            num_new_tokens,
-                            self.st_recent_window_frames * frame_seqlen
-                        ),
-                        is_first_timestep=bool(current_end > prev_global_end),
-                    )
+                    # ==========================================================
+                    # Timestep cache (Shield 1): reuse keep_indices across denoise steps
+                    # ==========================================================
+                    chunk_key = f"st_keep_indices_{int(current_end)}"
+                    if chunk_key not in kv_cache:
+                        keep_indices = self.st_compressor.compress(
+                            queries=kv_cache.get("st_recent_q", roped_query),
+                            keys=K_aug,
+                            kv_cache=kv_cache,
+                            frame_seqlen=frame_seqlen,
+                            spatial_shape=spatial_shape,
+                            sink_tokens=max(sink_tokens, sink_tokens_v),
+                            mandatory_recent_tokens=max(
+                                num_new_tokens,
+                                self.st_recent_window_frames * frame_seqlen
+                            ),
+                            is_first_timestep=bool(current_end > prev_global_end),
+                        )
+                        kv_cache[chunk_key] = keep_indices
+                        for k in [kk for kk in kv_cache.keys() if isinstance(kk, str) and kk.startswith("st_keep_indices_") and kk != chunk_key]:
+                            del kv_cache[k]
+                    else:
+                        keep_indices = kv_cache[chunk_key]
+
                     local_end_index = self.st_compressor.prune_cache_front(
                         kv_cache=kv_cache,
                         source_k=K_aug,
@@ -668,62 +680,86 @@ class CausalWanSelfAttention(nn.Module):
                 tail_end   = local_end_index
                 tail_start = max(sink_tokens, local_end_index - self.max_attention_size + sink_tokens)
 
-                # Calculate absolute frames
-                tail_len_tokens = tail_end - tail_start
-                tail_len_frames = tail_len_tokens // frame_seqlen
+                # ==========================================================
+                # Calculate absolute frames (FIXED ROPE COLLISION)
+                # ==========================================================
                 sink_len_frames = sink_len_tokens // frame_seqlen
+                
+                st_cfg = getattr(self, "ST", getattr(self, "st_cfg", None))
+                st_active = st_cfg.enable if st_cfg is not None else False
+                st_active = st_active and (self.local_attn_size != -1)
 
-                tail_start_abs_frame = current_start_frame - tail_len_frames
-                desired_sink_abs_start = tail_start_abs_frame - sink_len_frames
+                if st_active:
+                    mandatory_recent_tokens = max(
+                        num_new_tokens,
+                        self.st_recent_window_frames * frame_seqlen,
+                    )
+                    keep_sink_tokens = sink_tokens if getattr(st_cfg, "keep_sinks", True) else 0
+                    max_sink_tokens = max(0, local_end_index - mandatory_recent_tokens)
+                    sink_len_tokens = min(local_end_index, keep_sink_tokens, max_sink_tokens)
 
-                # sink delta rotation (in-place) — only time-axis channels
+                anchor_len_tokens = 0
+                anchor_len_frames = 0
+                current_end_frame = (current_end - 1) // frame_seqlen
+                
+                if st_active:
+                    recent_window_tokens = mandatory_recent_tokens
+                    anchor_start = sink_len_tokens
+                    anchor_end = max(sink_len_tokens, local_end_index - recent_window_tokens)
+                    anchor_len_tokens = max(0, anchor_end - anchor_start)
+                    anchor_len_frames = anchor_len_tokens // frame_seqlen
+                    
+                    tail_start_abs_frame = current_end_frame - self.st_recent_window_frames + 1
+                    # Strictly align the tail to start right after the anchors
+                    tail_start = anchor_end 
+                    desired_sink_abs_start = tail_start_abs_frame - anchor_len_frames - sink_len_frames
+                else:
+                    tail_len_tokens = tail_end - tail_start
+                    tail_len_frames = tail_len_tokens // frame_seqlen
+                    tail_start_abs_frame = current_end_frame - tail_len_frames + 1
+                    anchor_start = sink_len_tokens
+                    anchor_end = tail_start
+                    anchor_len_tokens = 0
+                    anchor_len_frames = 0
+                    desired_sink_abs_start = tail_start_abs_frame - sink_len_frames
+
+                # 1. Sink Delta Rotation (In-Place)
                 if self.sink_size > 0 and sink_len_tokens > 0:
                     if "sink_base_abs_start_frame" not in kv_cache:
                         kv_cache["sink_base_abs_start_frame"] = torch.tensor(desired_sink_abs_start, device=kv_cache["k"].device)
-                        # Legacy PC path uses an initial calibration offset. ST path
-                        # starts from zero and uses strict delta updates afterwards.
-                        delta = 0 if st_active else 21 - (self.PC.capacity // 1560)
-                    else:
-                        delta = int(desired_sink_abs_start - kv_cache["sink_base_abs_start_frame"].item())
-                        
+                    delta = int(desired_sink_abs_start - kv_cache["sink_base_abs_start_frame"].item())
                     if delta != 0:
                         _rope_time_delta_mul_(kv_cache["k"][:, :sink_len_tokens], freqs, delta)
-                        # 기준 업데이트
                         kv_cache["sink_base_abs_start_frame"].fill_(desired_sink_abs_start)
-                    if "abs_frame_idx" in kv_cache and sink_len_tokens > 0:
-                        sink_offsets = torch.arange(sink_len_tokens, device=kv_cache["k"].device)
-                        sink_frames = desired_sink_abs_start + torch.div(sink_offsets, frame_seqlen, rounding_mode='floor')
-                        kv_cache["abs_frame_idx"][:, :sink_len_tokens] = sink_frames
 
-                    key_win = torch.cat([
-                        kv_cache["k"][:, :sink_len_tokens],
-                        kv_cache["k"][:, tail_start:tail_end]
-                    ], dim=1)
-                    val_win = torch.cat([
-                        kv_cache["v"][:, :sink_len_tokens],
-                        kv_cache["v"][:, tail_start:tail_end]
-                    ], dim=1) 
-                else:
-                    key_win = kv_cache["k"][:, tail_start:tail_end]
-                    val_win = kv_cache["v"][:, tail_start:tail_end]
+                # 2. ST-Anchor Delta Rotation (In-Place)
+                if st_active and anchor_len_tokens > 0:
+                    desired_anchor_abs_start = tail_start_abs_frame - anchor_len_frames
+                    if "st_anchor_base_abs_start" not in kv_cache:
+                        kv_cache["st_anchor_base_abs_start"] = torch.tensor(desired_anchor_abs_start, device=kv_cache["k"].device)
+                    delta_anchor = int(desired_anchor_abs_start - kv_cache["st_anchor_base_abs_start"].item())
+                    if delta_anchor != 0:
+                        _rope_time_delta_mul_(kv_cache["k"][:, anchor_start:anchor_end], freqs, delta_anchor)
+                        kv_cache["st_anchor_base_abs_start"].fill_(desired_anchor_abs_start)
 
-                # Top-C RoPE compensation (after sink, before tail)
-                top_start = sink_tokens
-                top_end = tail_start
-                top_len_tokens = max(0, top_end - top_start)
-                if (not st_active) and top_len_tokens > 0:
-                    top_len_frames = math.ceil(top_len_tokens / frame_seqlen)
-                    desired_top_abs_start = tail_start_abs_frame - top_len_frames
-                    if "topc_base_abs_start_frame" not in kv_cache:
-                        kv_cache["topc_base_abs_start_frame"] = torch.tensor(desired_top_abs_start, device=kv_cache["k"].device)
-                    delta_top = int(desired_top_abs_start - kv_cache["topc_base_abs_start_frame"].item())
-                    if delta_top != 0:
-                        _rope_time_delta_mul_(kv_cache["k"][:, top_start:top_end], freqs, delta_top)
-                        kv_cache["topc_base_abs_start_frame"].fill_(desired_top_abs_start)
-                    if "abs_frame_idx" in kv_cache:
-                        top_offsets = torch.arange(top_len_tokens, device=kv_cache["k"].device)
-                        top_frames = desired_top_abs_start + torch.div(top_offsets, frame_seqlen, rounding_mode='floor')
-                        kv_cache["abs_frame_idx"][:, top_start:top_end] = top_frames
+                # 3. Build Attention Window (Decoupled and Safe)
+                k_parts = []
+                v_parts = []
+                
+                if sink_len_tokens > 0:
+                    k_parts.append(kv_cache["k"][:, :sink_len_tokens])
+                    v_parts.append(kv_cache["v"][:, :sink_len_tokens])
+                    
+                if st_active and anchor_len_tokens > 0:
+                    k_parts.append(kv_cache["k"][:, anchor_start:anchor_end])
+                    v_parts.append(kv_cache["v"][:, anchor_start:anchor_end])
+                    
+                if tail_end > tail_start:
+                    k_parts.append(kv_cache["k"][:, tail_start:tail_end])
+                    v_parts.append(kv_cache["v"][:, tail_start:tail_end])
+
+                key_win = torch.cat(k_parts, dim=1) if k_parts else kv_cache["k"][:, :0]
+                val_win = torch.cat(v_parts, dim=1) if v_parts else kv_cache["v"][:, :0]
 
             x = attention(roped_query, key_win, val_win)
 
@@ -911,6 +947,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  ST_lambda_reg: float = 0.5,
                  ST_epsilon: float = 1e-5,
                  ST_recent_window_frames: int = 4,
+                 ST_max_query_tokens: int = 2048,
                  ST_keep_sinks: bool = True,):
         r"""
         Initialize the diffusion model backbone.
@@ -999,6 +1036,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             lambda_reg=ST_lambda_reg,
             epsilon=ST_epsilon,
             recent_window_tokens=0,
+            max_query_tokens=ST_max_query_tokens,
             keep_sinks=ST_keep_sinks,
         )
         # blocks
