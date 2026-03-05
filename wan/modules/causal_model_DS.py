@@ -388,7 +388,8 @@ class CausalWanSelfAttention(nn.Module):
 
                     tail_start_abs_frame = current_end_frame - self.st_recent_window_frames + 1
                     tail_start = anchor_end
-                    desired_sink_abs_start = tail_start_abs_frame - anchor_len_frames - sink_len_frames
+                    # SemSink-Start0: semanticize the sink by pinning it to the beginning of the teacher horizon
+                    desired_sink_abs_start = 0
                 else:
                     tail_end = local_end_index
                     tail_start = max(sink_tokens, local_end_index - self.max_attention_size + sink_tokens)
@@ -399,7 +400,8 @@ class CausalWanSelfAttention(nn.Module):
                     anchor_end = tail_start
                     anchor_len_tokens = 0
                     anchor_len_frames = 0
-                    desired_sink_abs_start = tail_start_abs_frame - sink_len_frames
+                    # SemSink-Start0: semanticize the sink by pinning it to the beginning of the teacher horizon
+                    desired_sink_abs_start = 0
 
                 # ==========================================================
                 # EXACT PER-TOKEN ROPE REALIGNMENT
@@ -630,6 +632,7 @@ class CausalWanModelDS(ModelMixin, ConfigMixin):
                  cross_attn_norm=True,
                  eps=1e-6,
                  ST_enable: bool = True,
+                 ST_mode: str = "spectral",
                  ST_target_budget: int = 0,
                  ST_grid_size=(4, 2, 2),
                  ST_pool_size: int = 1024,
@@ -709,6 +712,7 @@ class CausalWanModelDS(ModelMixin, ConfigMixin):
             nn.SiLU(), nn.Linear(dim, dim * 6))
         self.ST_cfg = STSpectralCppConfig(
             enable=ST_enable,
+            mode=ST_mode,
             target_budget=ST_target_budget,
             grid_size=ST_grid_size,
             pool_size=ST_pool_size,

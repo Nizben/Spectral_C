@@ -12,7 +12,7 @@ from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 from wan.modules.causal_model_DS import CausalWanModelDS
 
-DEFAULT_WAN_MODEL_NAME = "Wan2.1-T2V-14B"
+DEFAULT_WAN_MODEL_NAME = "Wan2.1-T2V-1.3B"
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -132,6 +132,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             budget=16,
             recent=4,
             st_enable=True,
+            st_mode="spectral",
             st_target_budget=None,
             st_grid_size=(4, 2, 2),
             st_pool_size=1024,
@@ -151,6 +152,8 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if "ST_enable" in kwargs and kwargs["ST_enable"] is not None:
             st_enable = kwargs.pop("ST_enable")
+        if "ST_mode" in kwargs and kwargs["ST_mode"] is not None:
+            st_mode = kwargs.pop("ST_mode")
         if "ST_target_budget" in kwargs and kwargs["ST_target_budget"] is not None:
             st_target_budget = kwargs.pop("ST_target_budget")
         if "ST_grid_size" in kwargs and kwargs["ST_grid_size"] is not None:
@@ -197,6 +200,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     local_attn_size=local_attn_size,
                     sink_size=sink_size,
                     ST_enable=st_enable,
+                    ST_mode=st_mode,
                     ST_target_budget=st_target_budget,
                     ST_grid_size=st_grid_size,
                     ST_pool_size=st_pool_size,
@@ -214,6 +218,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     PC_capacity=1560*budget,
                     PC_window=1560*recent,
                     ST_enable=st_enable,
+                    ST_mode=st_mode,
                     ST_target_budget=st_target_budget,
                     ST_grid_size=st_grid_size,
                     ST_pool_size=st_pool_size,

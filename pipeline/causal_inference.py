@@ -371,6 +371,7 @@ class CausalInferencePipeline(torch.nn.Module):
         Initialize a Per-GPU KV cache for the Wan model.
         """
         kv_cache1 = []
+        st_shared = {}
         if self.local_attn_size != -1:
             # Use the local attention size to compute the KV cache size
             kv_cache_size = self.local_attn_size * self.frame_seq_length
@@ -378,12 +379,15 @@ class CausalInferencePipeline(torch.nn.Module):
             # Use the default KV cache size
             kv_cache_size = 32760
 
-        for _ in range(self.num_transformer_blocks):
+        for layer_idx in range(self.num_transformer_blocks):
             kv_cache1.append({
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                # Shared across layers to avoid L× ST recomputation.
+                "st_shared": st_shared,
+                "layer_idx": layer_idx,
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache

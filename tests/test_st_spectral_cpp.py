@@ -172,6 +172,54 @@ class TestSTSpectralCpp(unittest.TestCase):
         self.assertTrue(torch.all(kv_cache["k"][:, keep_len:] == 0))
         self.assertTrue(torch.all(kv_cache["v"][:, keep_len:] == 0))
 
+    def test_random_mode_keeps_sink_tail_and_fills_gap(self) -> None:
+        cfg = STSpectralCppConfig(
+            enable=True,
+            mode="random",
+            target_budget=18,
+            grid_size=(4, 2, 2),
+            pool_size=64,
+            lambda_reg=0.5,
+            epsilon=1e-6,
+            recent_window_tokens=0,
+            max_query_tokens=0,
+            keep_sinks=True,
+        )
+        compressor = STSpectralCppCompressor(cfg)
+
+        b, n_q, n_k, n_h, d_h = 1, 6, 40, 2, 4
+        queries = torch.randn(b, n_q, n_h, d_h)
+        keys = torch.randn(b, n_k, n_h, d_h)
+        sink_tokens = 10
+        mandatory_recent_tokens = 5
+
+        keep = compressor.compress(
+            queries=queries,
+            keys=keys,
+            kv_cache={},
+            frame_seqlen=10,
+            spatial_shape=(2, 5),
+            sink_tokens=sink_tokens,
+            mandatory_recent_tokens=mandatory_recent_tokens,
+            is_first_timestep=True,
+        )[0]
+
+        self.assertEqual(keep.numel(), 18)
+        self.assertEqual(torch.unique(keep).numel(), 18)
+        self.assertTrue(torch.all(keep[1:] >= keep[:-1]))
+
+        # Sink must be preserved (0..sink_tokens-1)
+        sink_expected = torch.arange(0, sink_tokens, device=keep.device)
+        self.assertTrue(torch.all(torch.isin(sink_expected, keep)))
+
+        # Tail must be preserved (n_k-mandatory_recent_tokens..n_k-1)
+        tail_expected = torch.arange(n_k - mandatory_recent_tokens, n_k, device=keep.device)
+        self.assertTrue(torch.all(torch.isin(tail_expected, keep)))
+
+        # The remaining picks must be from intermediate history region
+        mid = keep[(keep >= sink_tokens) & (keep < (n_k - mandatory_recent_tokens))]
+        self.assertEqual(mid.numel(), 18 - sink_tokens - mandatory_recent_tokens)
+
 
 if __name__ == "__main__":
     unittest.main()

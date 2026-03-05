@@ -9,6 +9,7 @@ class STSpectralCppConfig:
     def __init__(
         self,
         enable: bool = False,
+        mode: str = "spectral",
         target_budget: int = 0,
         grid_size: Tuple[int, int, int] = (4, 2, 2),
         pool_size: int = 1024,
@@ -19,6 +20,9 @@ class STSpectralCppConfig:
         keep_sinks: bool = True,
     ):
         self.enable = bool(enable)
+        self.mode = str(mode).lower().strip()
+        if self.mode not in {"spectral", "random"}:
+            raise ValueError(f"Unsupported ST mode: {mode!r}. Expected 'spectral' or 'random'.")
         self.target_budget = int(target_budget)
         self.grid_size = tuple(int(x) for x in grid_size)
         self.pool_size = int(pool_size)
@@ -253,6 +257,31 @@ class STSpectralCppCompressor:
             recent_idx = torch.arange(n_k - mandatory_recent_tokens, n_k, device=device, dtype=torch.long)
             keep_1d = torch.cat([sink_idx, recent_idx], dim=0)
             keep = keep_1d.unsqueeze(0).expand(bsz, -1)
+            kv_cache["st_cached_keep_indices"] = keep
+            return keep
+
+        # ==========================================================
+        # Random ablation mode:
+        # Keep sink + mandatory recent, fill the remaining budget uniformly
+        # at random from intermediate history. No utility scoring, no anchors,
+        # no Gram-Schmidt.
+        # ==========================================================
+        if getattr(self.cfg, "mode", "spectral") == "random":
+            sink_idx = torch.arange(keep_sink_tokens, device=device, dtype=torch.long)
+            recent_idx = torch.arange(n_k - mandatory_recent_tokens, n_k, device=device, dtype=torch.long)
+            mid_start = keep_sink_tokens
+            mid_end = n_k - mandatory_recent_tokens
+            candidates = torch.arange(mid_start, mid_end, device=device, dtype=torch.long)
+            need = int(target_budget - (keep_sink_tokens + mandatory_recent_tokens))
+            keep = torch.zeros((bsz, target_budget), dtype=torch.long, device=device)
+            for b in range(bsz):
+                if need > 0 and candidates.numel() > 0:
+                    perm = torch.randperm(candidates.numel(), device=device)
+                    mid_pick = candidates[perm[:need]]
+                    keep_1d = torch.cat([sink_idx, mid_pick, recent_idx], dim=0)
+                else:
+                    keep_1d = torch.cat([sink_idx, recent_idx], dim=0)
+                keep[b] = torch.sort(keep_1d[:target_budget]).values
             kv_cache["st_cached_keep_indices"] = keep
             return keep
 
